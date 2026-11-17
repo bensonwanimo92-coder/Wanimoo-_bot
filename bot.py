@@ -280,8 +280,7 @@ async def goal_monitor(app: Application):
                     except Exception:
                         log.exception("Facebook goal publishing failed")
 
-                was_finished = old is not None and is_finished(old[2] or "")
-                if is_finished(match["status"]) and not was_finished:
+                if is_finished(match["status"]):
                     try:
                         await publish_facebook(app, match, "fulltime")
                     except Exception:
