@@ -88,7 +88,7 @@ def normalize(raw: dict):
 
     status = raw.get("status") or fixture.get("status") or {}
     if isinstance(status, dict):
-        status_text = str(pick(status, "short", "code", "name", "description",
+        status_text = str(pick(status, "short", "code", "name", "long", "description",
                                "status", default="")).strip()
     else:
         status_text = str(status or "").strip()
