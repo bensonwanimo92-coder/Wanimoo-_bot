@@ -50,11 +50,23 @@ def pick(obj, *keys, default=None):
 
 
 def normalize(raw: dict):
-    fixture = raw.get("fixture") or {}
-    match_id = pick(raw, "id", "fixtureId", "matchId", "uuid") or pick(fixture, "id", "fixtureId")
-    score = raw.get("score") or {}
-    home_score = pick(raw, "homeScore", default=pick(score, "home", "homeScore"))
-    away_score = pick(raw, "awayScore", default=pick(score, "away", "awayScore"))
+    # GOAL API v1 returns fixture rows in the response's "data" array.
+    fixture = raw.get("fixture") or raw
+    match_id = (
+        pick(raw, "id", "fixtureId", "matchId", "uuid")
+        or pick(fixture, "id", "fixtureId", "matchId")
+    )
+    score = raw.get("score") or fixture.get("score") or {}
+    home_score = pick(
+        raw, "homeScore", "homeTeamScore",
+        default=pick(fixture, "homeScore", "homeTeamScore",
+                     default=pick(score, "home", "homeScore"))
+    )
+    away_score = pick(
+        raw, "awayScore", "awayTeamScore",
+        default=pick(fixture, "awayScore", "awayTeamScore",
+                     default=pick(score, "away", "awayScore"))
+    )
     if match_id is None or home_score is None or away_score is None:
         return None
     try:
@@ -63,12 +75,20 @@ def normalize(raw: dict):
         return None
 
     def name(side):
-        team = raw.get(side + "Team") or raw.get(side) or {}
-        return team if isinstance(team, str) else str(pick(team, "name", "shortName", default=side.title()))
+        team = (
+            raw.get(side + "Team") or fixture.get(side + "Team")
+            or raw.get(side) or fixture.get(side) or {}
+        )
+        return team if isinstance(team, str) else str(
+            pick(team, "name", "shortName", default=side.title())
+        )
 
-    status = raw.get("status") or {}
-    minute = pick(raw, "matchMinute", "minute", "elapsed",
-                  default=pick(status, "minute", "elapsed", default=""))
+    status = raw.get("status") or fixture.get("status") or {}
+    minute = pick(
+        raw, "matchMinute", "minute", "elapsed", "matchStatus",
+        default=pick(fixture, "matchMinute", "minute", "elapsed", "matchStatus",
+                     default=pick(status, "minute", "elapsed", default=""))
+    )
     return {"id": str(match_id), "home": name("home"), "away": name("away"),
             "hs": home_score, "as": away_score, "minute": str(minute or "")}
 
@@ -77,12 +97,18 @@ def parse_matches(payload: Any):
     if isinstance(payload, list):
         rows = payload
     elif isinstance(payload, dict):
-        rows = payload.get("data") or payload.get("fixtures") or payload.get("matches") or []
+        rows = payload.get("data")
+        if rows is None:
+            rows = payload.get("fixtures") or payload.get("matches") or []
+        # Some API gateways wrap the fixture list one level deeper.
         if isinstance(rows, dict):
-            rows = rows.get("data") or []
+            rows = rows.get("data") or rows.get("fixtures") or rows.get("matches") or []
     else:
         rows = []
-    return [m for m in (normalize(x) for x in rows if isinstance(x, dict)) if m] if isinstance(rows, list) else []
+    if not isinstance(rows, list):
+        return []
+    return [match for match in (normalize(row) for row in rows
+                                if isinstance(row, dict)) if match]
 
 
 async def fetch(client: httpx.AsyncClient):
@@ -91,12 +117,34 @@ async def fetch(client: httpx.AsyncClient):
         headers={"Authorization": f"Bearer {API_KEY}", "Accept": "application/json"},
     )
     if response.status_code == 429:
-        log.warning("GOAL API rate limit reached; increase POLL_SECONDS.")
+        retry_after = response.headers.get("Retry-After", "not supplied")
+        log.warning("GOAL API rate limit/quota reached; Retry-After=%s", retry_after)
+        return []
+    if response.status_code == 204 or not response.content:
+        log.info("GOAL API returned no live fixtures (HTTP %s).", response.status_code)
         return []
     response.raise_for_status()
-    log.info("GOAL API remaining quota: %s",
-             response.headers.get("X-RateLimit-Remaining", "not supplied"))
-    return parse_matches(response.json())
+    remaining = response.headers.get("X-RateLimit-Remaining", "not supplied")
+    limit = response.headers.get("X-RateLimit-Limit", "not supplied")
+    log.info("GOAL API quota: %s/%s requests remaining", remaining, limit)
+    payload = response.json()
+    if isinstance(payload, dict) and payload.get("success") is False:
+        raise RuntimeError("GOAL API reported success=false: " +
+                           str(payload.get("error") or payload.get("message") or "unknown API error"))
+    matches = parse_matches(payload)
+    if not matches:
+        if isinstance(payload, dict):
+            rows = payload.get("data")
+            row_count = len(rows) if isinstance(rows, list) else "not a list"
+            row_keys = sorted(rows[0].keys()) if isinstance(rows, list) and rows and isinstance(rows[0], dict) else []
+            log.info("GOAL API parse diagnostic: top-level keys=%s, data_rows=%s, first_row_keys=%s",
+                     sorted(payload.keys()), row_count, row_keys)
+        else:
+            log.info("GOAL API returned payload type=%s with no parseable fixtures",
+                     type(payload).__name__)
+    else:
+        log.info("GOAL API live fixtures parsed: %s", len(matches))
+    return matches
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
