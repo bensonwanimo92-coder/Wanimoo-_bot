@@ -38,6 +38,9 @@ def database():
     conn.execute("""CREATE TABLE IF NOT EXISTS matches(
         match_id TEXT PRIMARY KEY, home_score INTEGER NOT NULL,
         away_score INTEGER NOT NULL, last_minute TEXT)""")
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(matches)")}
+    if "status" not in columns:
+        conn.execute("ALTER TABLE matches ADD COLUMN status TEXT NOT NULL DEFAULT ''")
     return conn
 
 
@@ -84,13 +87,19 @@ def normalize(raw: dict):
         )
 
     status = raw.get("status") or fixture.get("status") or {}
+    if isinstance(status, dict):
+        status_text = str(pick(status, "short", "code", "name", "long", "description",
+                               "status", default="")).strip()
+    else:
+        status_text = str(status or "").strip()
     minute = pick(
         raw, "matchMinute", "minute", "elapsed", "matchStatus",
         default=pick(fixture, "matchMinute", "minute", "elapsed", "matchStatus",
                      default=pick(status, "minute", "elapsed", default=""))
     )
     return {"id": str(match_id), "home": name("home"), "away": name("away"),
-            "hs": home_score, "as": away_score, "minute": str(minute or "")}
+            "hs": home_score, "as": away_score, "minute": str(minute or ""),
+            "status": status_text}
 
 
 def parse_matches(payload: Any):
@@ -193,6 +202,41 @@ async def live(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("\n".join(lines))
 
 
+def is_finished(status: str) -> bool:
+    value = (status or "").strip().upper().replace("-", "_")
+    return value in {"FT", "AET", "PEN", "FINISHED", "FULL_TIME",
+                     "FULL TIME", "ENDED", "MATCH FINISHED"} or "FINISHED" in value
+
+
+async def publish_facebook(app: Application, match: dict, event_type: str):
+    from facebook_publisher import publish_once
+
+    if event_type == "live":
+        key = f"live:{match['id']}"
+        message = (
+            f"🔴 LIVE MATCH\n\n{match['home']} {match['hs']} - "
+            f"{match['as']} {match['away']}\n"
+            f"⏱ {match['minute'] or 'Live'}\n\n"
+            f"⚽ WANIMOO FOOTBALL LIVE"
+        )
+    elif event_type == "goal":
+        key = f"goal:{match['id']}:{match['hs']}-{match['as']}"
+        message = (
+            f"⚽ GOAL! GOAL! GOAL!\n\n{match['home']} {match['hs']} - "
+            f"{match['as']} {match['away']}\n"
+            f"⏱ {match['minute'] or 'Live'}\n\n"
+            f"⚽ WANIMOO FOOTBALL LIVE"
+        )
+    else:
+        key = f"fulltime:{match['id']}:{match['hs']}-{match['as']}"
+        message = (
+            f"🏁 FULL-TIME RESULT\n\n{match['home']} {match['hs']} - "
+            f"{match['as']} {match['away']}\n\n"
+            f"⚽ WANIMOO FOOTBALL LIVE"
+        )
+    await publish_once(app.bot_data["http"], key, message)
+
+
 async def goal_monitor(app: Application):
     client = app.bot_data["http"]
     # Seed scores on first run so old goals are not announced as new.
@@ -205,19 +249,42 @@ async def goal_monitor(app: Application):
             for match in matches:
                 with database() as conn:
                     old = conn.execute(
-                        "SELECT home_score,away_score FROM matches WHERE match_id=?",
+                        "SELECT home_score,away_score,status FROM matches WHERE match_id=?",
                         (match["id"],),
                     ).fetchone()
                     conn.execute(
-                        """INSERT INTO matches VALUES(?,?,?,?)
+                        """INSERT INTO matches(match_id,home_score,away_score,last_minute,status)
+                        VALUES(?,?,?,?,?)
                         ON CONFLICT(match_id) DO UPDATE SET
                         home_score=excluded.home_score,
                         away_score=excluded.away_score,
-                        last_minute=excluded.last_minute""",
-                        (match["id"], match["hs"], match["as"], match["minute"]),
+                        last_minute=excluded.last_minute,
+                        status=excluded.status""",
+                        (match["id"], match["hs"], match["as"], match["minute"],
+                         match["status"]),
                     )
                     chats = [row[0] for row in
                              conn.execute("SELECT chat_id FROM subscribers")]
+
+                # Publish a live-score snapshot once per fixture. Event keys make
+                # repeated polling/restarts idempotent for each Facebook post.
+                if not is_finished(match["status"]):
+                    try:
+                        await publish_facebook(app, match, "live")
+                    except Exception:
+                        log.exception("Facebook live-score publishing failed")
+
+                if old is not None and (match["hs"] > old[0] or match["as"] > old[1]):
+                    try:
+                        await publish_facebook(app, match, "goal")
+                    except Exception:
+                        log.exception("Facebook goal publishing failed")
+
+                if is_finished(match["status"]):
+                    try:
+                        await publish_facebook(app, match, "fulltime")
+                    except Exception:
+                        log.exception("Facebook full-time publishing failed")
 
                 if old is None or first_cycle:
                     continue
